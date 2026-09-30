@@ -1,15 +1,29 @@
-#include "fa/fa_2d_unroll_gmma.hpp"
+#include "multi_thread/fa/fa_2d_unroll_gmma.hpp"
 
 #include <cstdint>
 
 #include "benchmark.h"
 #include "fileop.h"
+#include "multi_thread_res_check.h"
 
-// Element data type for Q/K/V and the stored O tile. Set via -DDTYPE=<token>
-// from the Makefile (float / __bf16 / __half). The score (W) and output
-// accumulator tiles remain FP32 inside the kernel template.
-#ifndef DTYPE
-#define DTYPE float
+// 4-PE cooperative TMATMUL FlashAttention driver (v2 optimized variant).
+// Natural V layout, transpose_b on PV, fused PV accumulation, TFMA for
+// scaled old-sum.
+
+#ifndef MATRIX_DTYPE
+#define MATRIX_DTYPE float
+#endif
+
+#ifndef VECTOR_DTYPE
+#define VECTOR_DTYPE float
+#endif
+
+#ifndef PACKED_FACTOR
+#define PACKED_FACTOR 1
+#endif
+
+#ifndef USE_MX
+#define USE_MX 0
 #endif
 
 #define B 1
@@ -28,11 +42,19 @@
 #endif
 
 #ifndef qD
+#ifdef FA_QD
+#define qD FA_QD
+#else
 #define qD 128
+#endif
 #endif
 
 #ifndef vD
+#ifdef FA_VD
+#define vD FA_VD
+#else
 #define vD 128
+#endif
 #endif
 
 #ifndef Tm
@@ -51,29 +73,67 @@
 #define ALIGN (4 * 1024)
 
 int main() {
-    using dtype = DTYPE;
+    using matrix_dtype = MATRIX_DTYPE;
+    using vector_dtype = VECTOR_DTYPE;
     constexpr int kPeNum = 4;
+    constexpr int kIoTid = 0;
+    const uint32_t tid = get_thread_idx();
+    constexpr int kStoredQD = qD / PACKED_FACTOR;
+    constexpr int kStoredSkv = globSkv / PACKED_FACTOR;
+    constexpr int kGroupM = kTm <= 128 ? kTm : 128;
+    constexpr int kPeTm = kGroupM <= 64 ? 16 : 32;
+    constexpr int kStoredTk = kTk / PACKED_FACTOR;
 
     static_assert(globSq % kPeNum == 0,
                   "global Sq must be divisible by the PE count");
 
-    dtype qp[B * H * globSq * qD + 2 * ALIGN];
-    dtype kp[B * H * globSkv * qD + 2 * ALIGN];
-    dtype vp[B * H * globSkv * vD + 2 * ALIGN];
-    dtype outp[B * H * globSq * vD + 2 * ALIGN];
+    static matrix_dtype qp[B * H * globSq * kStoredQD + 2 * ALIGN];
+    static matrix_dtype kp[B * H * globSkv * kStoredQD + 2 * ALIGN];
+    static matrix_dtype vp[B * H * kStoredSkv * vD + 2 * ALIGN];
+    static vector_dtype outp[B * H * globSq * vD + 2 * ALIGN];
+    static uint8_t qsp[B * H * globSq * (qD / 32) + 2 * ALIGN];
+    static uint8_t ksp[B * H * globSkv * (qD / 32) + 2 * ALIGN];
+    static uint8_t vsp[B * H * (globSkv / 32) * vD + 2 * ALIGN];
+#ifdef RES_CHECK
+    static MultiThreadResCheckSync res_check_sync{};
+#endif
 
-    dtype *q = (dtype *)(((uint64_t)qp & ALIGN_MASK) + ALIGN);
-    dtype *k = (dtype *)(((uint64_t)kp & ALIGN_MASK) + ALIGN);
-    dtype *v = (dtype *)(((uint64_t)vp & ALIGN_MASK) + ALIGN);
-    dtype *out = (dtype *)(((uint64_t)outp & ALIGN_MASK) + ALIGN);
+    matrix_dtype *q =
+        (matrix_dtype *)(((uint64_t)qp & ALIGN_MASK) + ALIGN);
+    matrix_dtype *k =
+        (matrix_dtype *)(((uint64_t)kp & ALIGN_MASK) + ALIGN);
+    matrix_dtype *v =
+        (matrix_dtype *)(((uint64_t)vp & ALIGN_MASK) + ALIGN);
+    vector_dtype *out =
+        (vector_dtype *)(((uint64_t)outp & ALIGN_MASK) + ALIGN);
+    uint8_t *q_scale = (uint8_t *)(((uint64_t)qsp & ALIGN_MASK) + ALIGN);
+    uint8_t *k_scale = (uint8_t *)(((uint64_t)ksp & ALIGN_MASK) + ALIGN);
+    uint8_t *v_scale = (uint8_t *)(((uint64_t)vsp & ALIGN_MASK) + ALIGN);
 
 #ifdef RES_CHECK
 #define SRCQ_PATH CHK_DIR "/srcq.bin"
 #define SRCK_PATH CHK_DIR "/srck.bin"
 #define SRCV_PATH CHK_DIR "/srcv.bin"
-    readBinaryFile(SRCQ_PATH, (uint8_t *)q, B * H * globSq * qD * sizeof(dtype));
-    readBinaryFile(SRCK_PATH, (uint8_t *)k, B * H * globSkv * qD * sizeof(dtype));
-    readBinaryFile(SRCV_PATH, (uint8_t *)v, B * H * globSkv * vD * sizeof(dtype));
+    if (tid == kIoTid) {
+        readBinaryFile(SRCQ_PATH, (uint8_t *)q,
+                       B * H * globSq * kStoredQD * sizeof(matrix_dtype));
+        readBinaryFile(SRCK_PATH, (uint8_t *)k,
+                       B * H * globSkv * kStoredQD * sizeof(matrix_dtype));
+        readBinaryFile(SRCV_PATH, (uint8_t *)v,
+                       B * H * kStoredSkv * vD * sizeof(matrix_dtype));
+#if USE_MX
+#define SRCQS_PATH CHK_DIR "/srcq_scale.bin"
+#define SRCKS_PATH CHK_DIR "/srck_scale.bin"
+#define SRCVS_PATH CHK_DIR "/srcv_scale.bin"
+        readBinaryFile(SRCQS_PATH, q_scale,
+                       B * H * globSq * (qD / 32));
+        readBinaryFile(SRCKS_PATH, k_scale,
+                       B * H * globSkv * (qD / 32));
+        readBinaryFile(SRCVS_PATH, v_scale,
+                       B * H * (globSkv / 32) * vD);
+#endif
+    }
+    res_check_publish_inputs(res_check_sync, tid);
 #endif
 
     BENCHSTART;
@@ -81,23 +141,28 @@ int main() {
     for (int i = 0; i < B; ++i) {
 #pragma clang loop unroll(full)
         for (int j = 0; j < H; ++j) {
-            // All four PEs load the same full shared Q/K/V tiles (PEMask=1),
-            // so the kernel receives the full globSq / globSkv (mirrors
-            // matmul_shared passing the full globM).
+            // PE0 loads the full shared Q/K/V tiles (PEMask=1), which are
+            // then consumed cooperatively by all four PEs. The RES_CHECK I/O
+            // uses the same PE0 thread.
             flash_attention_2d_unroll_shared_impl<
-                dtype, globSq, globSkv, qD, vD, kTm, kTk>(
+                matrix_dtype, vector_dtype, PACKED_FACTOR,
+                globSq, globSkv, qD, vD, kTm, kTk>(
                 out + i * H * globSq * vD + j * globSq * vD,
-                q + i * H * globSq * qD + j * globSq * qD,
-                k + i * H * globSkv * qD + j * globSkv * qD,
-                v + i * H * globSkv * vD + j * globSkv * vD);
+                q + i * H * globSq * kStoredQD + j * globSq * kStoredQD,
+                k + i * H * globSkv * kStoredQD +
+                    j * globSkv * kStoredQD,
+                v + i * H * kStoredSkv * vD + j * kStoredSkv * vD);
         }
     }
     BENCHEND;
 
 #ifdef RES_CHECK
 #define RES_PATH CHK_DIR "/res.bin"
-    writeBinaryFile(RES_PATH, (uint8_t *)out,
-                    B * H * globSq * vD * sizeof(dtype));
+    res_check_wait_for_all(res_check_sync, tid);
+    if (tid == kIoTid) {
+        writeBinaryFile(RES_PATH, (uint8_t *)out,
+                        B * H * globSq * vD * sizeof(vector_dtype));
+    }
 #endif
 
     return 0;

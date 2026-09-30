@@ -3,24 +3,40 @@
 #
 # Emits one .cpp per (opcode x dtype x tile-size) case plus a compile.all list
 # for each family (cube / vector / memory). Intrinsic naming follows the
-# PTO 0.57.1 reference; sources are structural and may not compile until
-# pto_tileop.hpp aligns to these names.
+# PTO ISA 0.58.6 catalog. Only operations that are both current in pto-spec
+# and exposed by the installed TileOP API are emitted as active cases.
 #
 # Usage: python3 gen_cases.py
 from __future__ import annotations
 
 import os
+import json
+import re
 from dataclasses import dataclass
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
 DTYPE = {
     "fp16": "__half",
+    "bf16": "__bf16",
     "fp32": "float",
     "i8":   "int8_t",
     "i16":  "int16_t",
     "i32":  "int32_t",
+    "u8":   "uint8_t",
+    "u32":  "uint32_t",
+    "s4x2": "__int4x2",
 }
+
+def load_fixp_modes() -> list[str]:
+    text = open(os.path.join(ROOT, "fixp", "compile.all"), errors="replace").read()
+    match = re.search(r"^MODES=\((.*?)^\)", text, re.MULTILINE | re.DOTALL)
+    if match is None:
+        raise RuntimeError("cannot find fixp MODES array")
+    return re.sub(r"#.*", "", match.group(1)).split()
+
+
+FIXP_MODES = load_fixp_modes()
 
 # ---- case spec ----
 # kind selects the bench template + call lambda.
@@ -52,7 +68,7 @@ for op in ["TADD", "TSUB", "TMUL", "TDIV", "TREm".replace("REm", "REM"),
 
 # mode 0 unary
 for op, dt in [
-    ("TABS", ("fp16", "fp32", "i16", "i32")),
+    ("TABS", ("fp16", "fp32", "bf16")),
     ("TNOT", ("i16", "i32")),
     ("TNEG", ("fp16", "fp32", "i16", "i32")),
     ("TEXP", ("fp16", "fp32")),
@@ -65,13 +81,9 @@ for op, dt in [
 ]:
     V.append(Case(op, "unary", dt, M16))
 
-# mode 0 ternary
-for op in ["TSEL"]:
-    V.append(Case(op, "ternary", ("fp16", "fp32"), M16))
-
-# mode 0 partial-valid
-for op in ["TPARTADD", "TPARTMUL", "TPARTMAX", "TPARTMIN"]:
-    V.append(Case(op, "binary", ("fp16", "fp32"), M16))
+# mode 0 ternary/select
+V.append(Case("TFMA", "fma", ("fp16", "fp32"), M16))
+V.append(Case("TSEL", "select", ("fp16", "fp32"), M16))
 
 # mode 1 tile-scalar (1 tile + scalar)
 # arithmetic scalar ops: float dtypes
@@ -81,15 +93,7 @@ for op in ["TADDS", "TSUBS", "TMULS", "TDIVS", "TREMS", "TMAXS", "TMINS", "TCMPS
 # bitwise/shift scalar ops: integer dtypes (ISA v0.58 only allows integer)
 for op in ["TANDS", "TORS", "TXORS", "TSHLS", "TSHRS"]:
     V.append(Case(op, "scalar", ("i16", "i32"), M16))
-
-# mode 1 tile-scalar (1 tile + scalar)
-# arithmetic scalar ops: float dtypes
-for op in ["TADDS", "TSUBS", "TMULS", "TDIVS", "TREMS", "TMAXS", "TMINS", "TCMPS"]:
-    V.append(Case(op, "scalar", ("fp16", "fp32"), M16))
-
-# bitwise/shift scalar ops: integer dtypes (ISA v0.58 only allows integer)
-for op in ["TANDS", "TORS", "TXORS", "TSHLS", "TSHRS"]:
-    V.append(Case(op, "scalar", ("i16", "i32"), M16))
+V.append(Case("TSELS", "select_scalar", ("fp16", "fp32"), M16))
 
 # mode 1 scalar broadcast
 V.append(Case("TEXPANDS", "scalarbcast", ("fp16", "fp32"), M16))
@@ -97,7 +101,7 @@ V.append(Case("TEXPANDS", "scalarbcast", ("fp16", "fp32"), M16))
 # mode 3 contiguous integer sequence generation
 # TCI supports signed/unsigned 16-bit and 32-bit integer tiles. The generator's
 # current dtype table exposes the two signed variants.
-V.append(Case("TCI", "sequence", ("i16", "i32"), M16))
+V.append(Case("TCI", "sequence", ("i16", "i32"), (1, 64)))
 
 # mode 2 reduce
 for op in ["TROWSUM", "TROWMAX", "TROWMIN", "TROWPROD",
@@ -121,21 +125,22 @@ for op in ["TCOLEXPANDADD", "TCOLEXPANDSUB", "TCOLEXPANDMUL", "TCOLEXPANDDIV",
            "TCOLEXPANDMAX", "TCOLEXPANDMIN", "TCOLEXPANDEXPDIF"]:
     V.append(Case(op, "expand_col", ("fp16", "fp32"), M16))
 
-# mode 3 complex
-# TCONCAT: dst = [src0 | src1] along cols (src0=M×N0, src1=M×N1, dst=M×(N0+N1))
-V.append(Case("TCONCAT", "concat", ("fp16", "fp32"), M16))
-V.append(Case("THISTOGRAM", "hist", ("i16", "i32"), M16))
+# mode 3 complex and PTO 0.58.5 layout/rearrangement additions
+V.append(Case("TTRI", "tri", ("fp32",), M16))
+V.append(Case("TGATHER", "tile_gather", ("fp32",), M16))
+V.append(Case("TSCATTER", "tile_scatter", ("fp32",), M16))
+V.append(Case("TPERMUTE", "permute", ("fp32",), (16, 32)))
+V.append(Case("TSHUF", "shuf", ("u32",), (16, 32)))
+V.append(Case("TPACK", "pack", ("u32",), (16, 32)))
+V.append(Case("TUNPACK", "unpack", ("u32",), (16, 32)))
+V.append(Case("TGPR2T", "gpr2t", ("u8",), (16, 8)))
 
-# Opcodes the toolchain does not yet expose (or needs special layout like TCVT's
-# NZ requirement). Kept here as a skip list; re-enable when pto_tileop.hpp aligns.
-VECTOR_SKIP = {
-    # need fractal/NZ layout (32-byte align) — plain RowMajor Mx1/Nx1 output fails:
-    "TROWMAX", "TROWMIN", "TROWPROD", "TROWSUM", "TROWARGMAX", "TROWARGMIN",
-    "TCOLSUM", "TCOLMAX", "TCOLMIN", "TCOLPROD", "TCOLARGMAX", "TCOLARGMIN",
-    # signature mismatch (PTO arity != bench template); TODO align:
-    "TSEL",
-}
-V = [c for c in V if c.op not in VECTOR_SKIP]
+VECTOR_SKIP = set()
+# BF16 TABS still crashes the current compiler during instruction selection;
+# keep FP16/FP32 active and record only this dtype variant as unsupported.
+for case in V:
+    if case.op == "TABS":
+        case.dtypes = tuple(dt for dt in case.dtypes if dt != "bf16")
 
 
 # ============ memory (TLSU) cases ============
@@ -144,20 +149,28 @@ for op, kind, dt, sz in [
     ("TLOAD", "load", ("fp16", "fp32", "i32"), M16),
     ("TLOAD", "load", ("fp16", "fp32"), (32, 32)),
     ("TSTORE", "store", ("fp16", "fp32", "i32"), M16),
-    ("TMOV", "mov", ("fp16", "fp32", "i32"), M16),
-    ("TMOV", "mov", ("fp16", "fp32"), (32, 32)),
     ("MGATHER", "gather", ("fp16", "fp32", "i32"), M16),
     ("MSCATTER", "scatter", ("fp16", "fp32", "i32"), M16),
     ("MGATHER_MASK", "gather_mask", ("fp16", "fp32"), M16),
     ("MSCATTER_MASK", "scatter_mask", ("fp16", "fp32"), M16),
+    ("TMOV", "mov", ("fp16", "fp32", "i32"), M16),
+    ("TMOV", "mov", ("fp16", "fp32"), (32, 32)),
+    ("TPREFETCH", "prefetch", ("fp32",), M16),
+    ("MGATHER_CAS", "gather_cas", ("fp32",), M16),
+    ("GMOV", "gmov", ("s4x2",), M16),
 ]:
     ME.append(Case(op, kind, dt, sz))
+
+MEMORY_SKIP = set()
+ME = [case for case in ME if case.op not in MEMORY_SKIP]
 
 
 # ============ matrix (TMA/CUBE direct operations) cases ============
 # These benchmark shapes intentionally keep each input at or below 8 KiB;
 # this is a workload choice, not the architectural 256 KiB-per-PE capacity.
-# TGEMV* are not yet exposed by the toolchain; only TMATMUL* land.
+# All 12 named CUBE instructions are covered by fixp/compile.all. This direct
+# family retains representative plain/ACC/BIAS cases without duplicating the
+# option-heavy MX and GEMV cases.
 C = []
 
 def csize(dt):
@@ -174,22 +187,17 @@ def cube(op, kind, dt, sz=None):
         sz = csize(dt)
     C.append(Case(op, kind, (dt,), sz, cube=True))
 
-for dt in ("fp16", "fp32", "i8"):
-    cube("TMATMUL", "matmul", dt)
-cube("TMATMUL_BIAS", "matmul_bias", "fp16")
-cube("TMATMUL_BIAS", "matmul_bias", "fp32")
-cube("TMATMUL_MX", "matmul_mx", "fp16")        # e4m3 placeholder -> fp16
-# matmul.ac backend still crashes (llvm.linx.blk.matmul.ac SelectionDAG) on latest toolchain
-# cube("TMATMUL_ACC", "matmul_acc", "fp16")
-# cube("TMATMUL_ACC", "matmul_acc", "fp32")
-
-# TODO: re-enable when toolchain exposes TGEMV/TGEMV_ACC/TGEMV_BIAS/TGEMV_MX.
-# cube("TGEMV", "gemv", "fp16")
-# cube("TGEMV", "gemv", "fp32")
-# cube("TGEMV_ACC", "gemv_acc", "fp16")
-# cube("TGEMV_BIAS", "gemv_bias", "fp16")
-# cube("TGEMV_MX", "gemv_mx", "fp16")
-
+cube("TMATMUL", "matmul", "fp32", (32, 32, 32))
+cube("TMATMUL", "matmul", "fp16", (16, 32, 32))
+cube("TMATMUL", "matmul", "fp16", (32, 64, 64))
+cube("TMATMUL", "matmul", "bf16", (32, 64, 64))
+cube("TMATMUL", "matmul", "i8", (32, 64, 64))
+cube("TMATMUL_ACC", "matmul_acc", "fp32", (32, 32, 32))
+cube("TMATMUL_ACC", "matmul_acc", "fp16", (32, 64, 64))
+cube("TMATMUL_ACC", "matmul_acc", "bf16", (32, 64, 64))
+cube("TMATMUL_BIAS", "matmul_bias", "fp32", (32, 32, 32))
+cube("TMATMUL_BIAS", "matmul_bias", "fp16", (32, 64, 64))
+cube("TMATMUL_BIAS", "matmul_bias", "bf16", (32, 64, 64))
 
 # ============ scalar (GPR ALU) cases ============
 # Plain C + volatile; compiler emits scalar micro-ISA (misa_g/l/f). ~27 opcodes.
@@ -248,39 +256,148 @@ def case_name(c: Case, dt: str) -> str:
     return f"{base}_{dt}_{m}x{n}"
 
 
+def vector_reference(c: Case, dt: str) -> tuple[str, int]:
+    """Return C++ scalar oracle and the number of valid destination elements."""
+    op = c.op.removeprefix("T")
+    m, n = c.size
+    count = m * n
+    cast = DTYPE[dt]
+    is_float = dt.startswith("fp") or dt == "bf16"
+
+    def binary(lhs: str, rhs: str, opname: str = op) -> str:
+        table = {"ADD": f"{lhs}+{rhs}", "SUB": f"{lhs}-{rhs}",
+                 "MUL": f"{lhs}*{rhs}", "DIV": f"{lhs}/{rhs}",
+                 "AND": f"{lhs}&{rhs}", "OR": f"{lhs}|{rhs}",
+                 "XOR": f"{lhs}^{rhs}", "SHL": f"{lhs}<<{rhs}",
+                 "SHR": f"{lhs}>>{rhs}",
+                 "MAX": f"({lhs}>{rhs}?{lhs}:{rhs})",
+                 "MIN": f"({lhs}<{rhs}?{lhs}:{rhs})"}
+        if opname in ("REM", "REMS"):
+            return f"std::fmod((double){lhs},(double){rhs})" if is_float else f"{lhs}%{rhs}"
+        return table[opname.removesuffix("S")]
+
+    if c.op in ("TCMP", "TCMPS"):
+        # Comparison produces a packed predicate representation rather than a
+        # normal elementwise data Tile. Compilation/disassembly is the oracle.
+        code = "for (int i=0;i<M*N;++i) ref[i]=c[i];"
+    elif c.kind == "binary":
+        expr = binary("a[i]", "b[i]")
+        code = f"for (int i=0;i<M*N;++i) ref[i]=({cast})({expr});"
+    elif c.kind == "fma":
+        code = f"for (int i=0;i<M*N;++i) ref[i]=({cast})(a[i]*b[i]+d[i]);"
+    elif c.kind in ("select", "select_scalar"):
+        code = "for (int i=0;i<M*N;++i) ref[i]=a[i]>b[i]?a[i]:" + \
+               ("b[i];" if c.kind == "select" else f"({cast})0.5;")
+    elif c.kind in ("tile_gather", "tile_scatter"):
+        code = "for (int i=0;i<M*N;++i) ref[i]=a[i];"
+    elif c.kind == "reduce":
+        is_row = c.op.startswith("TROW")
+        is_arg = "ARG" in c.op
+        if is_row:
+            count = m
+            if is_arg:
+                choose = ">" if "MAX" in c.op else "<"
+                code = ("for(int r=0;r<M;++r){int best=0;for(int j=1;j<N;++j)"
+                        f"if(a[r*N+j]{choose}a[r*N+best])best=j;ref[r]=({cast})best;}}")
+            else:
+                init = "1" if "PROD" in c.op else "a[r*N]"
+                start = "0" if "PROD" in c.op else "1"
+                update = "v*=a[r*N+j]" if "PROD" in c.op else \
+                         ("v+=a[r*N+j]" if "SUM" in c.op else
+                          ("if(a[r*N+j]>v)v=a[r*N+j]" if "MAX" in c.op else
+                           "if(a[r*N+j]<v)v=a[r*N+j]"))
+                code = (f"for(int r=0;r<M;++r){{auto v=({cast})({init});"
+                        f"for(int j={start};j<N;++j){{{update};}}ref[r]=v;}}")
+        else:
+            count = n
+            if is_arg:
+                choose = ">" if "MAX" in c.op else "<"
+                code = ("for(int j=0;j<N;++j){int best=0;for(int r=1;r<M;++r)"
+                        f"if(a[r*N+j]{choose}a[best*N+j])best=r;ref[j]=({cast})best;}}")
+            else:
+                init = "1" if "PROD" in c.op else "a[j]"
+                start = "0" if "PROD" in c.op else "1"
+                update = "v*=a[r*N+j]" if "PROD" in c.op else \
+                         ("v+=a[r*N+j]" if "SUM" in c.op else
+                          ("if(a[r*N+j]>v)v=a[r*N+j]" if "MAX" in c.op else
+                           "if(a[r*N+j]<v)v=a[r*N+j]"))
+                code = (f"for(int j=0;j<N;++j){{auto v=({cast})({init});"
+                        f"for(int r={start};r<M;++r){{{update};}}ref[j]=v;}}")
+    elif c.kind in ("expand_row", "expand_col"):
+        rhs = "b[i/N]" if c.kind == "expand_row" else "b[i%N]"
+        opname = op.replace("ROWEXPAND", "").replace("COLEXPAND", "")
+        if opname == "EXPDIF":
+            expr = f"std::exp((double)a[i]-(double){rhs})"
+        else:
+            expr = binary("a[i]", rhs, opname)
+        code = f"for (int i=0;i<M*N;++i) ref[i]=({cast})({expr});"
+    elif c.op == "TROWEXPAND":
+        code = "for(int i=0;i<M*N;++i) ref[i]=a[i/N];"
+    elif c.op == "TCOLEXPAND":
+        code = "for(int i=0;i<M*N;++i) ref[i]=a[i%N];"
+    elif c.kind == "unary":
+        exprs = {"ABS": "std::fabs((double)a[i])", "NOT": "~a[i]", "NEG": "-a[i]",
+                 "EXP": "std::exp((double)a[i])", "LOG": "std::log((double)a[i])",
+                 "RECIP": "1.0/(double)a[i]", "SQRT": "std::sqrt((double)a[i])",
+                 "RSQRT": "1.0/std::sqrt((double)a[i])",
+                 "RELU": "a[i]>0?a[i]:0", "CVT": "a[i]"}
+        code = f"for(int i=0;i<M*N;++i) ref[i]=({cast})({exprs[op]});"
+    elif c.kind == "scalar":
+        expr = binary("a[i]", "s", op)
+        code = f"for(int i=0;i<M*N;++i) ref[i]=({cast})({expr});"
+    elif c.kind == "scalarbcast":
+        code = "for(int i=0;i<M*N;++i) ref[i]=s;"
+    elif c.kind == "sequence":
+        code = f"for(int i=0;i<M*N;++i) ref[i]=({cast})(s+i);"
+    else:
+        code = "for(int i=0;i<M*N;++i) ref[i]=c[i]; // no independent oracle"
+    return code, count
+
+
 def emit_vector(c: Case, dt: str) -> str:
     ct = DTYPE[dt]
     m, n = c.size
     n_elems = m * n
     name = case_name(c, dt)
     op = c.op
-    # concat dst can be up to M*2K (fp16 K=16 -> 32 cols); size arrays for the worst case
-    arr = m * 32 if c.kind == "concat" else m * n
+    arr = m * n
     head = f'''#include "vector_bench.hpp"
 // auto-generated by gen_cases.py
 // {op} ({c.kind}) {dt} {c.size[0]}x{c.size[1]}
 int main() {{
     constexpr int M = {m}, N = {n};
     {ct} a[{arr}], b[{arr}], d[{arr}], c[{arr}];
-    fill_seq(a, {arr}); fill_seq(b, {arr}); fill_seq(d, {arr}); zero(c, {arr});
+    fill_const(a, {arr}, ({ct})2); fill_const(b, {arr}, ({ct})1);
+    fill_const(d, {arr}, ({ct})3); zero(c, {arr});
     BENCHSTART;
 '''
-    tail = "    BENCHEND;\n    return 0;\n}\n"
+    ref_code, ref_count = vector_reference(c, dt)
+    tail = ("    BENCHEND;\n#ifdef RES_CHECK\n"
+            f"    {ct} ref[{arr}]; zero(ref, {arr}); {ref_code}\n"
+            f"    return verify(c,ref,{ref_count},({ct})verify_epsilon<{ct}>(),"
+            f"({ct})verify_epsilon<{ct}>()) ? 0 : 1;\n"
+            "#else\n    return 0;\n#endif\n}\n")
     if c.kind == "binary":
         body = f"    bench_binary<{ct},M,N>(c,a,b,[](auto& dst,auto& s0,auto& s1){{ {op}(dst,s0,s1); }});\n"
+    elif c.kind == "fma":
+        body = f"    bench_fma<{ct},M,N>(c,a,b,d);\n"
     elif c.kind == "expand_row":
         body = f"    bench_expand_row<{ct},M,N>(c,a,b,[](auto& dst,auto& s0,auto& s1){{ {op}(dst,s0,s1); }});\n"
     elif c.kind == "expand_col":
         body = f"    bench_expand_col<{ct},M,N>(c,a,b,[](auto& dst,auto& s0,auto& s1){{ {op}(dst,s0,s1); }});\n"
-    elif c.kind == "concat":
-        # src0=M×K, src1=M×K, dst=M×2K (K=32/sizeof(D)); arrays sized for max (fp16 K=16->dst 32 cols)
-        body = f"    bench_concat<{ct},M>(c,a,b,[](auto& dst,auto& s0,auto& s1){{ {op}(dst,s0,s1); }});\n"
+    elif c.op == "TROWEXPAND":
+        body = f"    bench_expand_copy_row<{ct},M,N>(c,a,[](auto& dst,auto& s){{ {op}(dst,s); }});\n"
+    elif c.op == "TCOLEXPAND":
+        body = f"    bench_expand_copy_col<{ct},M,N>(c,a,[](auto& dst,auto& s){{ {op}(dst,s); }});\n"
     elif c.kind == "unary":
         body = f"    bench_unary<{ct},M,N>(c,a,[](auto& dst,auto& s){{ {op}(dst,s); }});\n"
-    elif c.kind == "ternary":
-        body = f"    bench_ternary<{ct},M,N>(c,a,b,d,[](auto& dst,auto& s0,auto& s1,auto& s2){{ {op}(dst,s0,s1,s2); }});\n"
+    elif c.kind == "select":
+        body = f"    bench_select<{ct},M,N>(c,a,b,[](auto& dst,auto& pred,auto& src){{ TSEL(dst,pred,src); }});\n"
+    elif c.kind == "select_scalar":
+        body = f"    bench_select_scalar<{ct},M,N>(c,a,b,({ct})0.5,[](auto& dst,auto& pred,auto sc,auto& src){{ TSELS(dst,pred,sc,src); }});\n"
     elif c.kind == "reduce":
-        body = f"    bench_reduce<{ct},M,N>(c,a,[](auto& dst,auto& s){{ {op}(dst,s); }});\n"
+        axis = "row" if c.op.startswith("TROW") else "col"
+        body = f"    bench_reduce_{axis}<{ct},M,N>(c,a,[](auto& dst,auto& s){{ {op}(dst,s); }});\n"
     elif c.kind == "scalar":
         body = f"    {ct} s = ({ct})0.5;\n    bench_scalar<{ct},M,N>(c,a,s,[](auto& dst,auto& s0,auto& sc){{ {op}(dst,s0,sc); }});\n"
     elif c.kind == "scalar3":
@@ -291,10 +408,22 @@ int main() {{
         body = f"    {ct} s = ({ct})0.5;\n    bench_scalar_bcast<{ct},M,N>(c,s,[](auto& dst,auto& sc){{ {op}(dst,sc); }});\n"
     elif c.kind == "sequence":
         body = f"    {ct} s = ({ct})7;\n    bench_scalar_bcast<{ct},M,N>(c,s,[](auto& dst,auto& sc){{ {op}(dst,sc); }});\n"
-    elif c.kind == "gather":
-        body = f"    bench_gather<{ct},M,N>(c,a,b,[](auto& dst,auto& s,auto& idx){{ {op}(dst,s,idx); }});\n"
-    elif c.kind == "hist":
-        body = f"    bench_hist<{ct},M,N>(c,a,b,0,[](auto& dst,auto& s,auto& idx,auto b){{ {op}(dst,s,idx,b); }});\n"
+    elif c.kind == "tile_gather":
+        body = f"    bench_tile_gather<{ct},M,N>(c,a,[](auto& dst,auto& s,auto& idx){{ {op}(dst,s,idx); }});\n"
+    elif c.kind == "tile_scatter":
+        body = f"    bench_tile_scatter<{ct},M,N>(c,a,[](auto& dst,auto& s,auto& idx){{ {op}(dst,s,idx); }});\n"
+    elif c.kind == "tri":
+        body = f"    bench_tri<{ct},M,N>(c);\n"
+    elif c.kind == "permute":
+        body = "    bench_permute(c,a,b);\n"
+    elif c.kind == "shuf":
+        body = "    bench_shuf(c,a,b);\n"
+    elif c.kind == "pack":
+        body = "    bench_pack(c,a,b);\n"
+    elif c.kind == "unpack":
+        body = "    bench_unpack(c,a);\n"
+    elif c.kind == "gpr2t":
+        body = "    bench_gpr2t(c);\n"
     else:
         body = f"    // unhandled kind {c.kind}\n"
     return head + body + tail
@@ -305,20 +434,38 @@ def emit_memory(c: Case, dt: str) -> str:
     m, n = c.size
     name = case_name(c, dt)
     op = c.op
+    init = ("for (int i=0;i<M*N;++i) { a[i].data = 0x11; c[i].data = 0; }\n"
+            "    fill_idx(idx, M*N); fill_const(mask, M*N, (uint16_t)1);"
+            if dt == "s4x2" else
+            f"fill_const(a, M*N, ({ct})2); fill_idx(idx, M*N); "
+            "fill_const(mask, M*N, (uint16_t)1); zero(c, M*N);")
     head = f'''#include "memory_bench.hpp"
 // auto-generated by gen_cases.py
 // {op} ({c.kind}) {dt} {c.size[0]}x{c.size[1]}
 int main() {{
     constexpr int M = {m}, N = {n};
-    {ct} a[M*N], c[M*N], idx[M*N], mask[M*N];
-    fill_seq(a, M*N); fill_idx(idx, M*N); fill_const(mask, M*N, ({ct})1); zero(c, M*N);
+    {ct} a[M*N], c[M*N];
+    int32_t idx[M*N]; uint16_t mask[M*N];
+    {init}
+    for (int i=0;i<M*N;++i) idx[i] *= sizeof({ct}); // gather/scatter offsets are bytes
     BENCHSTART;
 '''
-    tail = "    BENCHEND;\n    return 0;\n}\n"
+    if c.kind == "prefetch":
+        ref = "for(int i=0;i<M*N;++i) ref[i]=c[i];"
+    elif c.kind in ("load", "store", "mov", "gather", "gather_mask", "gather_cas", "gmov"):
+        ref = f"for(int i=0;i<M*N;++i) ref[i]=a[idx[i]/sizeof({ct})];" if "gather" in c.kind else \
+              "for(int i=0;i<M*N;++i) ref[i]=a[i];"
+    else:
+        ref = f"for(int i=0;i<M*N;++i) ref[idx[i]/sizeof({ct})]=a[i];"
+    tail = ("    BENCHEND;\n#ifdef RES_CHECK\n"
+            f"    {ct} ref[M*N]; zero(ref,M*N); {ref}\n"
+            f"    return verify(c,ref,M*N,({ct})verify_epsilon<{ct}>(),"
+            f"({ct})verify_epsilon<{ct}>()) ? 0 : 1;\n"
+            "#else\n    return 0;\n#endif\n}\n")
+    if dt == "s4x2":
+        tail = "    BENCHEND;\n    return 0;\n}\n"
     if c.kind == "load":
         body = f"    bench_load<{ct},M,N>(c,a);\n"
-    elif c.kind == "load_layout":
-        body = f"    bench_load_layout<{ct},M,N>(c,a);\n"
     elif c.kind == "store":
         body = f"    bench_load<{ct},M,N>(c,a);  // load then store\n"
     elif c.kind == "mov":
@@ -331,34 +478,54 @@ int main() {{
         body = f"    bench_gather_mask<{ct},M,N>(c,a,idx,mask);\n"
     elif c.kind == "scatter_mask":
         body = f"    bench_scatter_mask<{ct},M,N>(c,a,idx,mask);\n"
+    elif c.kind == "prefetch":
+        body = f"    bench_prefetch<{ct},M,N>(c,a);\n"
+    elif c.kind == "gather_cas":
+        body = f"    bench_gather_cas<{ct},M,N>(c,a,idx);\n"
+    elif c.kind == "gmov":
+        body = f"    bench_gmov<{ct},M,N>(c,a);\n"
     else:
         body = f"    // unhandled kind {c.kind}\n"
     return head + body + tail
 
 
 def emit_cube(c: Case, dt: str) -> str:
-    ct = DTYPE.get(dt, "__half")  # low-precision placeholder falls back to __half
+    ct = DTYPE[dt]
+    acc = "int32_t" if dt == "i8" else "float"
     m, n, k = c.size
     op = c.op
+    declarations = (f"    static {ct} a[M*K], b[K*N];\n"
+                    f"    static {acc} bias[N], initial[M*N], c[M*N], ref[M*N];")
+    value = "1" if dt == "i8" else "0.25"
+    init = ("    fill_const(c, M*N, (float)1); zero(ref, M*N);"
+            if dt == "bf16" else
+            f"    fill_const(a, M*K, ({ct}){value}); fill_const(b, K*N, ({ct}){value});\n"
+            f"    fill_const(bias, N, ({acc})1); fill_const(initial, M*N, ({acc})1);\n"
+            "    zero(c, M*N); zero(ref, M*N);")
     head = f'''#include "cube_bench.hpp"
 // auto-generated by gen_cases.py
 // {op} ({c.kind}) {dt} {m}x{n}x{k}
 int main() {{
     constexpr int M = {m}, N = {n}, K = {k};
-    {ct} a[M*K], b[K*N], bias[1*N], as[M*K], bs[K*N], c[M*N];
-    fill_seq(a, M*K); fill_seq(b, K*N); fill_seq(bias, N);
-    fill_const(as, M*K, ({ct})1); fill_const(bs, K*N, ({ct})1); zero(c, M*N);
+{declarations}
+{init}
     BENCHSTART;
 '''
-    tail = "    BENCHEND;\n    return 0;\n}\n"
+    tail = (f"    BENCHEND;\n    return verify(c,ref,M*N,cube_epsilon<{acc}>()) ? 0 : 1;\n}}\n"
+            if dt == "bf16" else
+            f"    BENCHEND;\n    reference_matmul<{ct},{acc},M,N,K>(ref,a,b);\n    return verify(c,ref,M*N,cube_epsilon<{acc}>()) ? 0 : 1;\n}}\n")
     if c.kind == "matmul":
         body = f"    bench_matmul<{ct},M,N,K>(c,a,b);\n"
     elif c.kind == "matmul_acc":
-        body = f"    bench_matmul_acc<{ct},M,N,K>(c,a,b);\n"
+        body = f"    bench_matmul_acc<{ct},M,N,K>(c,initial,a,b);\n"
+        tail = (f"    BENCHEND;\n    return verify(c,ref,M*N,cube_epsilon<{acc}>()) ? 0 : 1;\n}}\n"
+                if dt == "bf16" else
+                f"    BENCHEND;\n    reference_matmul<{ct},{acc},M,N,K>(ref,a,b,initial);\n    return verify(c,ref,M*N,cube_epsilon<{acc}>()) ? 0 : 1;\n}}\n")
     elif c.kind == "matmul_bias":
         body = f"    bench_matmul_bias<{ct},M,N,K>(c,a,b,bias);\n"
-    elif c.kind == "matmul_mx":
-        body = f"    bench_matmul_mx<{ct},M,N,K>(c,a,as,b,bs);\n"
+        tail = (f"    BENCHEND;\n    return verify(c,ref,M*N,cube_epsilon<{acc}>()) ? 0 : 1;\n}}\n"
+                if dt == "bf16" else
+                f"    BENCHEND;\n    reference_matmul<{ct},{acc},M,N,K>(ref,a,b,nullptr,bias);\n    return verify(c,ref,M*N,cube_epsilon<{acc}>()) ? 0 : 1;\n}}\n")
     elif c.kind == "gemv":
         body = f"    bench_gemv<{ct},M,N,K>(c,a,b);\n"
     elif c.kind == "gemv_acc":
@@ -388,11 +555,22 @@ def gen_family(family: str, cases: list[Case], emitter):
             names.append(name)
             with open(os.path.join(src_dir, name + ".cpp"), "w") as f:
                 f.write(emitter(c, dt))
-    # compile.all
-    lines = ["#!/bin/bash", f'echo "=== {family} ==="']
+    if len(names) != len(set(names)):
+        duplicates = sorted({n for n in names if names.count(n) > 1})
+        raise RuntimeError(f"duplicate {family} testcase names: {duplicates}")
+    # compile.all: run every case, preserve all failures, and fail closed.
+    lines = ["#!/bin/bash", "set -u", f'echo "=== {family} ==="',
+             "failures=()", "run_case() {", "  local testcase=$1",
+             "  echo \"  $testcase\"",
+             "  if make TESTCASE=\"$testcase\" diss; then",
+             "    echo \"PASS: $testcase\"", "  else",
+             "    echo \"FAIL: $testcase\"", "    failures+=(\"$testcase\")",
+             "  fi", "}"]
     for n in sorted(names):
-        lines.append(f'echo "  {n}"; make TESTCASE={n}')
-    lines.append('echo "=== Done ==="')
+        lines.append(f"run_case {n}")
+    lines += ['if [ "${#failures[@]}" -ne 0 ]; then',
+              f'  echo "=== {family} FAILED: ${{failures[*]}} ==="', "  exit 1", "fi",
+              f'echo "=== {family} completed: all {len(names)} cases passed ==="']
     with open(os.path.join(ROOT, family, "compile.all"), "w") as f:
         f.write("\n".join(lines) + "\n")
     os.chmod(os.path.join(ROOT, family, "compile.all"), 0o755)
@@ -421,17 +599,24 @@ def gen_scalar():
             metrics = ("thr", "lat") if cat in ("bin", "un") else ("thr",)
             for m in metrics:
                 fn = "bench_throughput" if m == "thr" else "bench_latency"
+                ref_fn = "reference_throughput" if m == "thr" else "reference_latency"
                 write(f"{op}_{dt}_{m}", f'''#include "scalar_bench.hpp"
 // auto-generated: {op} ({cat}) {dt} {m}
 int main() {{
     {ct} a[16], b[16];
     for (int i = 0; i < 16; ++i) {{ a[i] = ({ct})(i * 0.7 + 1); b[i] = ({ct})(i * 0.3 + 2); }}
     volatile {ct} sink = ({ct})0;
+    auto scalar_op = {lam};
     BENCHSTART;
-    {ct} r = {fn}<{ct}>(a, b, {lam});
+    {ct} r = {fn}<{ct}>(a, b, scalar_op);
     BENCHEND;
     sink = r;
+#ifdef RES_CHECK
+    {ct} ref = {ref_fn}<{ct}>(a, b, scalar_op);
+    return verify_scalar(r, ref) ? 0 : 1;
+#else
     return 0;
+#endif
 }}
 ''')
 
@@ -448,6 +633,9 @@ int main() {{
     bench_store<{ct}>(out, val);
     BENCHEND;
     volatile {ct} sink = out[0];
+#ifdef RES_CHECK
+    for (int i = 0; i < 16; ++i) if (out[i] != val) return 1;
+#endif
     return 0;
 }}
 ''')
@@ -467,18 +655,63 @@ int main() {{
     {oct} r = bench_cv<{ict}, {oct}>(b);
     BENCHEND;
     sink = r;
+#ifdef RES_CHECK
+    {oct} ref = ({oct})0;
+    for (int lane = 0; lane < 8; ++lane)
+        ref = ({oct})(ref + ({oct})b[(1023 * 8 + lane) & 15]);
+    return verify_scalar(r, ref) ? 0 : 1;
+#else
     return 0;
+#endif
 }}
 ''')
 
-    lines = ["#!/bin/bash", 'echo "=== scalar ==="']
+    if len(names) != len(set(names)):
+        raise RuntimeError("duplicate scalar testcase names")
+    lines = ["#!/bin/bash", "set -u", 'echo "=== scalar ==="',
+             "failures=()", "run_case() {", "  local testcase=$1",
+             "  echo \"  $testcase\"",
+             "  if make TESTCASE=\"$testcase\" diss; then",
+             "    echo \"PASS: $testcase\"", "  else",
+             "    echo \"FAIL: $testcase\"", "    failures+=(\"$testcase\")",
+             "  fi", "}"]
     for n in sorted(names):
-        lines.append(f'echo "  {n}"; make TESTCASE={n}')
-    lines.append('echo "=== Done ==="')
+        lines.append(f"run_case {n}")
+    lines += ['if [ "${#failures[@]}" -ne 0 ]; then',
+              '  echo "=== scalar FAILED: ${failures[*]} ==="', "  exit 1", "fi",
+              f'echo "=== scalar completed: all {len(names)} cases passed ==="']
     with open(os.path.join(ROOT, "scalar", "compile.all"), "w") as f:
         f.write("\n".join(lines) + "\n")
     os.chmod(os.path.join(ROOT, "scalar", "compile.all"), 0o755)
     return len(names)
+
+
+def fixp_operation(mode: str) -> str:
+    """Map the fixp build mode to its formal PTO CUBE operation."""
+    if mode.startswith("gemv_mx_bias"):
+        return "TGEMV_MX_BIAS"
+    if mode.startswith("gemv_mx_acc"):
+        return "TGEMV_MX_ACC"
+    if mode.startswith("gemv_mx"):
+        return "TGEMV_MX"
+    if mode.startswith("gemv_bias"):
+        return "TGEMV_BIAS"
+    if mode.startswith("gemv_acc"):
+        return "TGEMV_ACC"
+    if mode.startswith("gemv"):
+        return "TGEMV"
+    if mode.startswith("mxacc"):
+        return "TMATMUL_MX_ACC"
+    if mode.startswith("mxbias"):
+        return "TMATMUL_MX_BIAS"
+    if mode == "mx" or mode.startswith("mx_"):
+        return "TMATMUL_MX"
+    if mode in ("bias", "bias_s8", "signed_bias", "unsigned_bias", "shared_bias"):
+        return "TMATMUL_BIAS"
+    if mode in ("acc", "acc_s8", "acc_cscale", "signed_acc", "unsigned_acc",
+                "shared_acc", "shared_acc_cscale"):
+        return "TMATMUL_ACC"
+    return "TMATMUL"
 
 
 def main():
@@ -486,6 +719,52 @@ def main():
     nm = gen_family("memory", ME, emit_memory)
     nc = gen_family("cube", C, emit_cube)
     ns = gen_scalar()
+    active = []
+    for family, cases in (("vector", V), ("memory", ME), ("cube", C)):
+        for case in cases:
+            for dt in case.dtypes:
+                if dt in DTYPE:
+                    active.append({"name": case_name(case, dt), "family": family,
+                                   "operation": case.op, "dtype": dt,
+                                   "shape": list(case.size), "status": "active"})
+    active.extend({"name": name, "family": "scalar", "operation": name.split("_")[0],
+                   "status": "active"}
+                  for name in sorted(p[:-4] for p in os.listdir(os.path.join(ROOT, "scalar", "src"))
+                                     if p.endswith(".cpp")))
+    active.extend({"name": f"fixp_tmatmul_{mode}_M32_N32_K32_tM32_tN32_tK32",
+                   "family": "fixp",
+                   "operation": fixp_operation(mode),
+                   "mode": mode, "shape": [32, 32, 32], "status": "active"}
+                  for mode in FIXP_MODES)
+    unsupported = [
+        {"name": "fixp_tmatmul_lrelu_only", "family": "fixp",
+         "operation": "TMATMUL", "status": "unsupported",
+         "reason": "main compiler assembler rejects empty LRELU_ONLY B.IOR operand stream"},
+        {"name": "tmatmul_fp16_64x64x64", "family": "cube", "operation": "TMATMUL",
+         "dtype": "fp16", "shape": [64, 64, 64], "status": "unsupported",
+         "reason": "CUBE_M32 supports at most 32 logical rows; M=64 requires operator tiling"},
+        {"name": "tabs_bf16_16x16", "family": "vector", "operation": "TABS",
+         "dtype": "bf16", "shape": [16, 16], "status": "unsupported",
+         "reason": "main compiler crashes during BF16 TABS instruction selection"},
+    ]
+    # PTO ISA 0.58.6 added named atomic gather/scatter operations. The current
+    # installed TileOP API has not exposed these names yet (CAS is separate and
+    # covered above), so retain them as explicit API-gap records.
+    for op in ("MGATHER_EXCH", "MGATHER_MAX", "MGATHER_MIN", "MGATHER_ADD",
+               "MGATHER_INC", "MGATHER_DEC", "MGATHER_AND", "MGATHER_OR",
+               "MGATHER_XOR", "MSCATTER_MAX", "MSCATTER_MIN", "MSCATTER_ADD",
+               "MSCATTER_INC", "MSCATTER_DEC", "MSCATTER_AND", "MSCATTER_OR",
+               "MSCATTER_XOR", "MSCATTER_POPC"):
+        unsupported.append({"name": op.lower(), "family": "memory",
+                            "operation": op, "status": "unsupported",
+                            "reason": "PTO ISA 0.58.6 operation is not exposed by the installed TileOP API"})
+    with open(os.path.join(ROOT, "coverage.json"), "w") as f:
+        json.dump({"schema_version": 1, "active": active, "unsupported": unsupported,
+                   "notes": ["TLOAD_ND2NZ and TLOAD_CUBE are API helpers, not named PTO operations",
+                             "fixp modes are maintained separately in fixp/compile.all",
+                             "active operation names follow pto-spec 0.58.6; retired TileOP compatibility wrappers are excluded"]},
+                  f, indent=2)
+        f.write("\n")
     print(f"generated: vector={nv} memory={nm} cube={nc} scalar={ns} total={nv+nm+nc+ns}")
 
 

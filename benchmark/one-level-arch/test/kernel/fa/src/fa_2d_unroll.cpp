@@ -1,7 +1,7 @@
 #include <common/pto_tileop.hpp>
 #include "benchmark.h"
 #include "fileop.h"
-#include "fa/fa_2d_unroll.hpp"
+#include "single_thread/fa/fa_2d_unroll.hpp"
 
 #define B 1
 #define H 1
@@ -22,7 +22,7 @@
 #define vD 128
 
 #ifndef Tm
-#define kTm 8
+#define kTm 16
 #else
 #define kTm Tm
 #endif
